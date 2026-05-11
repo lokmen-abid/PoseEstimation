@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer
 from contextlib import asynccontextmanager
 from api.database import connect_db
-from api.routes import athletes, sessions, auth_routes
+from api.routes import athletes, sessions, auth_routes, club_routes
 
 security = HTTPBearer()
 
@@ -21,7 +21,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # ton futur frontend React
+    allow_origins=["http://localhost:5173"],  # ton futur frontend React
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,6 +29,7 @@ app.add_middleware(
 
 app.include_router(auth_routes.router,  prefix="/api/auth",     tags=["Auth"])
 app.include_router(athletes.router,     prefix="/api/athletes", tags=["Athletes"])
+app.include_router(club_routes.router,  prefix="/api/clubs",    tags=["Clubs"])
 #app.include_router(sessions.router,     prefix="/api/sessions", tags=["Sessions"])
 
 @app.get("/")

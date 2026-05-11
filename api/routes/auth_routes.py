@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, EmailStr
-from api.models import User
+from api.models import User, Club
 from api.auth import hash_password, verify_password, create_token, get_current_user
+from typing import Optional
+
 
 router = APIRouter()
 
@@ -11,6 +13,8 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     full_name: str
+    club_id: Optional[str] = None  # ← optionnel, None = indépendant
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -29,17 +33,25 @@ async def register(data: RegisterRequest):
     if existing:
         raise HTTPException(status_code=400, detail="Email déjà utilisé")
 
+    # Si club_id fourni, vérifier que le club existe
+    if data.club_id:
+        club = await Club.get(data.club_id)
+        if not club:
+            raise HTTPException(status_code=404, detail="Club introuvable")
+
     user = User(
         email=data.email,
         password_hash=hash_password(data.password),
         full_name=data.full_name,
+        club_id=data.club_id,
         status="pending"     # ← en attente validation admin
     )
     await user.insert()
 
     return {
         "message": "Compte créé. En attente de validation par l'administrateur.",
-        "email": user.email
+        "email": user.email,
+        "club_id": user.club_id
     }
 
 
@@ -64,7 +76,8 @@ async def login(data: LoginRequest):
             "id": str(user.id),
             "email": user.email,
             "full_name": user.full_name,
-            "role": user.role
+            "role": user.role,
+            "club_id": user.club_id
         }
     }
 
@@ -76,7 +89,7 @@ async def get_pending_users(current_user: User = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Accès admin requis")
 
     pending = await User.find(User.status == "pending").to_list()
-    return [{"id": str(u.id), "email": u.email, "full_name": u.full_name} for u in pending]
+    return [{"id": str(u.id), "email": u.email, "full_name": u.full_name , "club_id":u.club_id} for u in pending]
 
 
 @router.post("/approve")

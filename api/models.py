@@ -9,6 +9,7 @@ class User(Document):
     role: str = "specialist"       # "admin" | "specialist"
     full_name: str
     status: str = "pending"
+    club_id: Optional[str] = None  # ← None = spécialiste indépendant
     created_at: datetime = datetime.utcnow()
 
     class Settings:
@@ -59,3 +60,11 @@ class Metrics(Document):
 
     class Settings:
         name = "metrics"
+
+class Club(Document):
+    name: str
+    city: Optional[str] = None
+    created_at: datetime = datetime.utcnow()
+
+    class Settings:
+        name = "clubs"
