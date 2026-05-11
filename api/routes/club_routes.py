@@ -37,7 +37,7 @@ async def create_club(
 
 
 @router.get("/")
-async def list_clubs(current_user: User = Depends(get_current_user)):
+async def list_clubs():
     # Accessible par tous — spécialistes en ont besoin au register
     clubs = await Club.find_all().to_list()
     return [
