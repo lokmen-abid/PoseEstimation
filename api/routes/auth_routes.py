@@ -113,3 +113,18 @@ async def approve_user(data: ApproveRequest, current_user: User = Depends(get_cu
 
     await user.save()
     return {"message": msg}
+
+
+@router.get("/users")
+async def get_all_users(current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403)
+
+    users = await User.find(User.role == "specialist").to_list()
+    return [{
+        "id": str(u.id),
+        "email": u.email,
+        "full_name": u.full_name,
+        "status": u.status,
+        "club_id": u.club_id
+    } for u in users]
