@@ -3,5 +3,21 @@ __pycache__/
 *.pyc
 .idea/
 .env
+.env.*
 .cache/
+*.log
 .venv/
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── Output pipeline IA (résultats de test, vidéos, screenshots) ──
+output/
+output/results/
+output/screenshots/
+output/tmp_video/
+
+# ── Modèle MediaPipe (binaire lourd, pas sur Git) ──
+*.task
+
