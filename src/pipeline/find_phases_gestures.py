@@ -69,31 +69,86 @@ PHASE_ZONES: Dict[str, Dict[str, Tuple[float, float]]] = {
 }
 
 # ─────────────────────────────────────────────
-# SÉPARATION MINIMALE ENTRE PHASES (frames)
+# SÉPARATION MINIMALE ENTRE PHASES (secondes réelles)
+# Converti en frames via adapt_to_fps() selon le FPS de la vidéo
+# Valeurs basées sur la biomécanique du geste :
+#   serve      : Trophy->RLP ~0.5s | RLP->Impact ~0.3s
+#   forehand   : Prep->Accel ~0.3s | Accel->Impact ~0.25s
+#   backhand   : Prep->Impact ~0.3s | Impact->Follow ~0.25s
 # ─────────────────────────────────────────────
 
-MIN_FRAMES_BETWEEN: Dict[str, Dict[Tuple[str, str], int]] = {
+MIN_SECONDS_BETWEEN: Dict[str, Dict[Tuple[str, str], float]] = {
     "serve": {
-        ("trophy_position",  "racket_low_point"): 15,
-        ("racket_low_point", "ball_impact"):       10,
+        ("trophy_position",  "racket_low_point"): 0.50,
+        ("racket_low_point", "ball_impact"):       0.30,
     },
     "forehand": {
-        ("preparation",  "acceleration"): 10,
-        ("acceleration", "ball_impact"):  8,
+        ("preparation",  "acceleration"): 0.30,
+        ("acceleration", "ball_impact"):  0.25,
     },
     "backhand": {
-        ("preparation", "ball_impact"):    10,
-        ("ball_impact", "follow_through"): 8,
+        ("preparation", "ball_impact"):    0.30,
+        ("ball_impact", "follow_through"): 0.25,
     },
 }
 
 # ─────────────────────────────────────────────
-# PARAMÈTRES
+# PARAMÈTRES DE BASE (à 30 FPS — référence)
 # ─────────────────────────────────────────────
 
-LOCAL_EXTREMUM_WINDOW   = 10
-LOCAL_EXTREMUM_PENALTY  = 0.3
-QUALITY_STD_THRESHOLD   = 2.0
+LOCAL_EXTREMUM_WINDOW_SECONDS = 0.33   # +-10 frames a 30fps = +-0.33s
+LOCAL_EXTREMUM_PENALTY        = 0.3
+QUALITY_STD_THRESHOLD         = 2.0
+FPS_REFERENCE                 = 30.0
+
+
+def adapt_to_fps(fps: float) -> Tuple[int, Dict[str, Dict[Tuple[str, str], int]]]:
+    """
+    Adapte LOCAL_EXTREMUM_WINDOW et MIN_FRAMES_BETWEEN au FPS reel.
+
+    Logique :
+      - 0.5s reelle = 15 frames a 30fps, 30 frames a 60fps, 13 frames a 25fps
+      - LOCAL_EXTREMUM_WINDOW suit la meme logique : +-0.33s reel
+        = +-10 frames a 30fps, +-20 frames a 60fps
+
+    Args:
+        fps : FPS reel detecte depuis le JSON (timestamp_ms des frames)
+
+    Returns:
+        (local_window, min_frames_dict)
+    """
+    fps = max(fps, 1.0)
+    local_window = max(3, int(round(LOCAL_EXTREMUM_WINDOW_SECONDS * fps)))
+    min_frames: Dict[str, Dict[Tuple[str, str], int]] = {}
+    for gesture, pairs in MIN_SECONDS_BETWEEN.items():
+        min_frames[gesture] = {}
+        for pair, seconds in pairs.items():
+            min_frames[gesture][pair] = max(3, int(round(seconds * fps)))
+    return local_window, min_frames
+
+
+def detect_fps(frames: List[Dict]) -> float:
+    """
+    Estime le FPS reel depuis les timestamp_ms du JSON.
+    Utilise la mediane des intervalles entre frames consecutives
+    pour etre robuste aux frames manquantes.
+
+    Returns:
+        FPS estime (float), defaut 30.0 si non detectable
+    """
+    timestamps = [f.get("timestamp_ms") for f in frames if f.get("timestamp_ms") is not None]
+    if len(timestamps) < 2:
+        print("[FPS] Timestamps insuffisants — FPS par defaut : 30.0")
+        return FPS_REFERENCE
+    deltas = [timestamps[i+1] - timestamps[i]
+              for i in range(len(timestamps) - 1)
+              if timestamps[i+1] > timestamps[i]]
+    if not deltas:
+        print("[FPS] Deltas invalides — FPS par defaut : 30.0")
+        return FPS_REFERENCE
+    median_delta_ms = float(np.median(deltas))
+    fps = round(1000.0 / median_delta_ms, 1)
+    return fps
 
 # Seuil de détection backhand 2 mains via les angles
 # Si elbow_left est actif (non-None) sur plus de ce pourcentage de frames
@@ -208,7 +263,7 @@ def detect_backhand_variant(frames: List[Dict]) -> str:
 # ─────────────────────────────────────────────
 
 def is_local_extremum(values: np.ndarray, idx: int,
-                      window: int = LOCAL_EXTREMUM_WINDOW,
+                      window: int = 10,
                       kind: str = "min") -> bool:
     if np.isnan(values[idx]):
         return False
@@ -257,6 +312,7 @@ def find_candidate_frames(
     gesture: str,
     normatives: Dict,
     zones: Dict[str, Tuple[float, float]],
+    local_window: int = 10,
 ) -> Dict[str, List[Tuple[int, float, str]]]:
     """
     Pour chaque phase du geste, calcule un score de proximité
@@ -323,7 +379,7 @@ def find_candidate_frames(
                 kind = "min" if look == "min" else "max"
                 for i in range(zone_size):
                     if not np.isnan(values_zone[i]):
-                        if not is_local_extremum(values_zone, i, kind=kind):
+                        if not is_local_extremum(values_zone, i, window=local_window, kind=kind):
                             proximity[i] *= LOCAL_EXTREMUM_PENALTY
 
             scores += effective_weight * proximity
@@ -375,17 +431,21 @@ def validate_temporal_coherence(
 def select_best_combination(
     candidates: Dict[str, List[Tuple[int, float, str]]],
     gesture: str,
+    min_frames: Dict[str, Dict[Tuple[str, str], int]] = None,
 ) -> Tuple[Optional[Dict[str, int]], str]:
     """
-    Sélectionne la meilleure combinaison de frames respectant
-    l'ordre temporel et les séparations minimales.
+    Selectionne la meilleure combinaison de frames respectant
+    l'ordre temporel et les separations minimales.
 
     Returns:
-        (dict phase→frame, message)
+        (dict phase->frame, message)
         ou (None, message_erreur)
     """
     phase_order = list(PHASE_ZONES[gesture].keys())
-    min_between = MIN_FRAMES_BETWEEN[gesture]
+    # Utilise min_frames adapte au FPS si fourni, sinon valeurs par defaut 30fps
+    if min_frames is None:
+        _, min_frames = adapt_to_fps(FPS_REFERENCE)
+    min_between = min_frames[gesture]
 
     # Vérifie que tous les candidats existent
     for phase in phase_order:
@@ -503,7 +563,14 @@ def main():
     gesture = args.gesture
     print(f"[find_phases_gestures] {n} frames | geste : {gesture.upper()}")
 
-    # ── Détection variante backhand ──
+    # ── Detection FPS + adaptation hyperparametres ──
+    fps = detect_fps(frames)
+    local_window, min_frames = adapt_to_fps(fps)
+    print(f"[find_phases_gestures] FPS detecte : {fps} — "
+          f"local_window={local_window} frames | "
+          f"min_sep={list(min_frames[gesture].values())} frames")
+
+    # ── Detection variante backhand ──
     variant = None
     if gesture == "backhand":
         variant = args.variant if args.variant else detect_backhand_variant(frames)
@@ -517,7 +584,7 @@ def main():
     print_zone_info(n, gesture)
 
     # ── Candidats ──
-    candidates = find_candidate_frames(frames, gesture, normatives, zones)
+    candidates = find_candidate_frames(frames, gesture, normatives, zones, local_window)
 
     print("\n" + "="*70)
     print(f"FRAMES CANDIDATES — {gesture.upper()}"
@@ -546,7 +613,7 @@ def main():
     print("SÉLECTION OPTIMALE")
     print("="*70)
 
-    best, msg = select_best_combination(candidates, gesture)
+    best, msg = select_best_combination(candidates, gesture, min_frames)
 
     if best is not None:
         phase_order = list(PHASE_ZONES[gesture].keys())

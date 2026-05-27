@@ -480,6 +480,7 @@ async def run_pipeline(video_path: str, session_id: str,
         json.dump([
             {
                 "frame_number": d["frame_number"],
+                "timestamp_ms": d["timestamp_ms"],
                 "angles":       d["angles"],
                 "keypoints":    d["keypoints"],  # world coords (pour angles)
                 "image_kps":    d["image_kps"],  # image coords (pour squelette)
