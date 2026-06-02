@@ -34,11 +34,12 @@ class Athlete(Document):
 class Session(Document):
     athlete_id: str
     specialist_id: str
-    gesture_type: str              # "service" | "coup_droit" | "revers"
+    gesture_type: str  # "service" | "coup_droit" | "revers"
     video_url: str
-    status: str = "processing"     # "processing" | "completed" | "error"
+    status: str = "created"  # "created" | "processing" | "completed" | "error"
     fps: int = 30
     total_frames: Optional[int] = None
+    phase_annotations: Optional[Dict[str, int]] = None  # {"trophy_position": 145, ...}
     created_at: datetime = Field(default_factory=_now)
 
     class Settings:

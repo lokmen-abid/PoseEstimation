@@ -30,7 +30,7 @@ app.add_middleware(
 app.include_router(auth_routes.router,  prefix="/api/auth",     tags=["Auth"])
 app.include_router(athletes.router,     prefix="/api/athletes", tags=["Athletes"])
 app.include_router(club_routes.router,  prefix="/api/clubs",    tags=["Clubs"])
-#app.include_router(sessions.router,     prefix="/api/sessions", tags=["Sessions"])
+app.include_router(sessions.router,     prefix="/api/sessions", tags=["Sessions"])
 
 @app.get("/")
 async def root():
