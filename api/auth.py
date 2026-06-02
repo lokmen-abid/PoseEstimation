@@ -35,8 +35,14 @@ def create_token(user_id: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=_JWT_EXPIRE_MINUTES)
 
+    payload = {
+        "sub": user_id,
+        "exp": expire,
+    }
+
     return jwt.encode(
-        _JWT_SECRET,
+        payload,  # ← 1er arg : le payload
+        _JWT_SECRET,  # ← 2e arg : la clé secrète
         algorithm=_JWT_ALGORITHM
     )
 

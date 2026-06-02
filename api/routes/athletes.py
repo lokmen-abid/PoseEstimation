@@ -10,6 +10,7 @@ router = APIRouter(tags=["Athlètes"])
 class AthleteCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
     age: int = Field(..., ge=5, le=100)
+    sex: str = "male"
     dominant_hand: str = Field("right", pattern="^(right|left)$")
     medical_notes: Optional[str] = Field(None, max_length=2000)
 
@@ -26,6 +27,7 @@ class AthleteCreate(BaseModel):
 class AthleteUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=2, max_length=100)
     age: Optional[int] = Field(None, ge=5, le=100)
+    sex: Optional[str] = None
     dominant_hand: Optional[str] = Field(None, pattern="^(right|left)$")
     medical_notes: Optional[str] = Field(None, max_length=2000)
 
@@ -58,6 +60,7 @@ def _serialize(a: Athlete) -> dict:
         "id": str(a.id),
         "name": a.name,
         "age": a.age,
+        "sex": a.sex,
         "dominant_hand": a.dominant_hand,
         "medical_notes": a.medical_notes,
         "created_at": a.created_at.isoformat() if a.created_at else None,

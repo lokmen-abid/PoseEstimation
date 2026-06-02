@@ -23,6 +23,7 @@ class Athlete(Document):
     specialist_id: str
     name: str
     age: int
+    sex: str = "male"
     sport: str = "tennis"
     dominant_hand: str = "right"
     medical_notes: Optional[str] = None
