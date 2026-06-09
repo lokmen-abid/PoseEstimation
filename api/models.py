@@ -1,6 +1,6 @@
 from beanie import Document
 from pydantic import BaseModel, EmailStr , Field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from datetime import datetime , timezone
 
 def _now() -> datetime:
@@ -116,7 +116,7 @@ class Metrics(Document):
     phases_detected: Dict[str, int]  # {"trophy_position": 145, ...}
 
     joint_metrics: Dict[str, JointMetrics]  # stats par articulation sur toute la session
-    normative_comparison: Dict[str, float]  # {"knee_flexion_right": +3.2, ...} écart % vs Gorce
+    normative_comparison: Dict[str, Any]  # {"knee_flexion_right": +3.2, ...} écart % vs Gorce
     alerts: List[ClinicalAlert]  # vide pour l'instant, on valide les angles d'abord
 
     computed_at: datetime = Field(default_factory=_now)

@@ -13,7 +13,7 @@ GESTURE_TYPES = Literal["service", "coup_droit", "revers"]
 STATUS_TRANSITIONS = {
     "created":    ["processing"],
     "processing": ["completed", "error"],
-    "completed":  [],
+    "completed":  ["processing"],
     "error":      ["processing"],   # permettre un re-run
 }
 
@@ -382,7 +382,7 @@ async def analyze_session(
       Remplacer subprocess par asyncio.create_task() ou
       FastAPI BackgroundTasks pour un traitement non-bloquant.
     """
-    import subprocess, sys
+    import subprocess, sys, os
 
     session = await _get_session_or_403(session_id, str(current_user.id))
 
@@ -392,7 +392,7 @@ async def analyze_session(
             detail="Aucune vidéo uploadée. Utilisez d'abord POST /sessions/{id}/upload",
         )
 
-    if session.status not in ("processing", "error"):
+    if session.status not in ("processing","completed", "error"):
         raise HTTPException(
             status_code=422,
             detail=f"Impossible de lancer l'analyse depuis le statut '{session.status}'",
@@ -406,47 +406,61 @@ async def analyze_session(
         )
         # Ex : "trophy_position=145,racket_low_point=210,ball_impact=240"
 
+    project_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..")
+    )
+    pipeline_script = os.path.join(project_root, "src", "pipeline", "pose_ex3_3d_savgol.py")
+
     cmd = [
         sys.executable,
-        "src/pipeline/pose_ex3_3d_savgol.py",
-        "--video",      session.video_url,
+        pipeline_script,
+        "--video", session.video_url,
         "--session_id", session_id,
     ]
     if phases_arg:
         cmd += ["--phases", phases_arg]
     else:
-        cmd += ["--no_mongo"]   # exploration sans sauvegarde si pas d'annotations
+        cmd += ["--no_mongo"]
 
     session.status = "processing"
     await session.save()
 
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=600,
+            encoding="utf-8",
+            errors="replace",
+            cwd=project_root,
+            env=env,
+        )
+
+        stderr_tail = (result.stderr or "")[-500:]
+        stdout_tail = (result.stdout or "")[-200:]
 
         if result.returncode == 0:
             session.status = "completed"
             await session.save()
             return {
-                "message":      "Analyse terminée avec succès",
-                "session_id":   session_id,
-                "phases_used":  session.phase_annotations,
+                "message": "Analyse terminee avec succes",
+                "session_id": session_id,
+                "phases_used": session.phase_annotations,
                 "has_annotations": phases_arg is not None,
                 "hint": (
                     None if phases_arg
-                    else (
-                        "Analyse en mode exploration (sans annotations). "
-                        "Ajoutez les frames clés via PUT /sessions/{id} "
-                        "puis relancez pour obtenir les métriques cliniques."
-                    )
+                    else "Analyse exploratoire terminee. Annotez les frames cles puis relancez."
                 ),
             }
         else:
             session.status = "error"
             await session.save()
-            raise HTTPException(
-                status_code=500,
-                detail=f"Erreur pipeline : {result.stderr[-500:]}",
-            )
+            detail = stderr_tail or stdout_tail or "Erreur pipeline inconnue"
+            raise HTTPException(status_code=500, detail=f"Erreur pipeline : {detail}")
 
     except subprocess.TimeoutExpired:
         session.status = "error"
@@ -520,6 +534,219 @@ async def get_session_results(
         ],
         "computed_at": metrics.computed_at.isoformat() if metrics.computed_at else None,
     }
+
+
+@router.get(
+    "/{session_id}/candidates",
+    summary="Frames candidates pour annotation (screenshots + scores)",
+)
+async def get_phase_candidates(
+    session_id: str,
+    current_user=Depends(get_current_user),
+):
+    """
+    Analyse le JSON frames_angles_{session_id}.json produit par la Passe 1
+    et retourne pour chaque phase :
+      - frame suggérée (meilleure combinaison temporellement cohérente)
+      - top 3 candidats avec score et confiance
+      - screenshot base64 avec squelette dessiné (OpenCV)
+      - angles clés à cette frame
+
+    Prérequis : Passe 1 effectuée (frames_angles_{id}.json doit exister).
+    """
+    import os, sys, base64, cv2, numpy as np
+
+    session = await _get_session_or_403(session_id, str(current_user.id))
+
+    # ── Chemins ──────────────────────────────────────────────
+    project_root  = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    pipeline_dir  = os.path.join(project_root, "src", "pipeline")
+    results_dir   = os.path.join(project_root, "output", "results")
+    frames_json   = os.path.join(results_dir, f"frames_angles_{session_id}.json")
+
+    if not os.path.exists(frames_json):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Fichier frames_angles introuvable. "
+                "Lancez d'abord la Passe 1 via POST /sessions/{id}/analyze."
+            ),
+        )
+
+    # ── Import pipeline (chemin absolu) ──────────────────────
+    if pipeline_dir not in sys.path:
+        sys.path.insert(0, pipeline_dir)
+
+    try:
+        from find_phases_gestures import (
+            load_frames, detect_fps, adapt_to_fps,
+            find_candidate_frames, select_best_combination,
+            PHASE_ZONES, get_key_angles_str,
+        )
+        from normatives import get_normatives
+    except ImportError as e:
+        raise HTTPException(status_code=500, detail=f"Import pipeline échoué : {e}")
+
+    # ── Chargement frames JSON ────────────────────────────────
+    try:
+        frames = load_frames(frames_json)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lecture frames JSON échouée : {e}")
+
+    if not frames:
+        raise HTTPException(status_code=422, detail="JSON frames vide.")
+
+    # ── Mapping geste frontend → pipeline ────────────────────
+    GESTURE_MAP = {"service": "serve", "coup_droit": "forehand", "revers": "backhand"}
+    gesture = GESTURE_MAP.get(session.gesture_type, "serve")
+
+    # ── Détection FPS + candidats ─────────────────────────────
+    fps          = detect_fps(frames)
+    local_window, min_frames = adapt_to_fps(fps)
+    normatives   = get_normatives(gesture)
+    zones        = PHASE_ZONES.get(gesture, {})
+    candidates   = find_candidate_frames(frames, gesture, normatives, zones, local_window)
+    best, _      = select_best_combination(candidates, gesture, min_frames)
+
+    # ── Lookup frame par numéro ───────────────────────────────
+    frame_lookup = {f["frame_number"]: f for f in frames}
+
+    # ── Extraction screenshots OpenCV ────────────────────────
+    SKELETON_CONNECTIONS = [
+        (11, 12), (11, 23), (12, 24), (23, 24),
+        (11, 13), (13, 15), (12, 14), (14, 16),
+        (23, 25), (25, 27), (24, 26), (26, 28),
+    ]
+    KEY_LANDMARKS = {11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28}
+    KP_NAME_TO_IDX = {
+        "left_shoulder": 11, "right_shoulder": 12,
+        "left_elbow": 13,    "right_elbow": 14,
+        "left_wrist": 15,    "right_wrist": 16,
+        "left_hip": 23,      "right_hip": 24,
+        "left_knee": 25,     "right_knee": 26,
+        "left_ankle": 27,    "right_ankle": 28,
+    }
+
+    CONF_COLORS = {
+        "HIGH":       (60, 210, 60),
+        "MEDIUM":     (0,  200, 255),
+        "LOW":        (0,  165, 255),
+        "UNRELIABLE": (50,  50, 220),
+    }
+
+    def extract_frame_screenshot(video_path: str, frame_number: int,
+                                  frame_data: dict, phase_name: str,
+                                  confidence: str) -> str:
+        """Extrait la frame de la vidéo, dessine le squelette, retourne base64."""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return ""
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ret, img = cap.read()
+        cap.release()
+        if not ret:
+            return ""
+
+        h, w = img.shape[:2]
+        image_kps = frame_data.get("image_kps", {})
+
+        # Projeter keypoints
+        positions = {}
+        for name, idx in KP_NAME_TO_IDX.items():
+            kp = image_kps.get(name)
+            if kp:
+                positions[idx] = (int(kp["x"] * w), int(kp["y"] * h))
+
+        # Connexions
+        for (i, j) in SKELETON_CONNECTIONS:
+            if i in positions and j in positions:
+                cv2.line(img, positions[i], positions[j], (220, 220, 220), 2, cv2.LINE_AA)
+
+        # Points
+        for idx, (px, py) in positions.items():
+            color = (0, 200, 255) if idx in KEY_LANDMARKS else (0, 220, 160)
+            cv2.circle(img, (px, py), 7, color, -1, cv2.LINE_AA)
+            cv2.circle(img, (px, py), 8, (15, 15, 15), 1, cv2.LINE_AA)
+
+        # Label phase + frame en haut
+        conf_color = CONF_COLORS.get(confidence, (255, 255, 255))
+        label_text = f"{phase_name.replace('_', ' ').upper()}  |  Frame {frame_number}  |  {confidence}"
+        cv2.rectangle(img, (0, 0), (w, 30), (10, 10, 10), -1)
+        cv2.putText(img, label_text, (8, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, conf_color, 1, cv2.LINE_AA)
+
+        # Redimensionner pour le frontend (max 640px de large)
+        if w > 640:
+            scale = 640 / w
+            img = cv2.resize(img, (640, int(h * scale)), interpolation=cv2.INTER_AREA)
+
+        _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        return base64.b64encode(buf).decode("utf-8")
+
+    # ── Construction réponse ──────────────────────────────────
+    JOINT_SHORT = {
+        "knee_flexion_right":       "Genou D",
+        "trunk_inclination":        "Incl. tronc",
+        "shoulder_rotation_right":  "Rot. épaule D",
+        "shoulder_elevation_right": "Elv. épaule D",
+        "elbow_right":              "Coude D",
+        "knee_flexion_left":        "Genou G",
+        "trunk_rotation":           "Rot. tronc",
+        "hip_right":                "Hanche D",
+        "elbow_left":               "Coude G",
+    }
+
+    has_video = bool(session.video_url and os.path.exists(session.video_url))
+
+    result = {
+        "session_id":  session_id,
+        "gesture":     gesture,
+        "total_frames": len(frames),
+        "fps":         fps,
+        "best":        best,          # {phase: frame_number} sélection optimale
+        "has_video":   has_video,
+        "phases":      {},
+    }
+
+    for phase_name, frame_list in candidates.items():
+        top3 = frame_list[:3]
+        best_fn   = best.get(phase_name) if best else (top3[0][0] if top3 else None)
+        best_conf = top3[0][2] if top3 else "UNRELIABLE"
+
+        # Screenshot de la frame suggérée
+        screenshot_b64 = ""
+        if has_video and best_fn is not None and best_fn in frame_lookup:
+            screenshot_b64 = extract_frame_screenshot(
+                session.video_url, best_fn,
+                frame_lookup[best_fn], phase_name, best_conf
+            )
+
+        # Angles clés à cette frame
+        key_angles = {}
+        if best_fn is not None and best_fn in frame_lookup:
+            angles = frame_lookup[best_fn].get("angles", {})
+            phase_joints = list(normatives.get(phase_name, {}).keys())[:5]
+            for joint in phase_joints:
+                val = angles.get(joint)
+                if val is not None:
+                    key_angles[JOINT_SHORT.get(joint, joint)] = round(val, 1)
+
+        result["phases"][phase_name] = {
+            "suggested_frame": best_fn,
+            "confidence":      best_conf,
+            "screenshot_b64":  screenshot_b64,
+            "key_angles":      key_angles,
+            "top3": [
+                {
+                    "frame":      fn,
+                    "score":      round(score, 3),
+                    "confidence": conf,
+                }
+                for fn, score, conf in top3
+            ],
+        }
+
+    return result
 
 
 # ── Annotations seulement ───────────────────────────────────
