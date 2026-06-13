@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, Query, UploadFile, File
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Literal
 from api.models import Session, Athlete, Frame, Metrics
@@ -338,7 +338,7 @@ async def upload_video(
         await out.write(content)
 
     session.video_url = save_path
-    session.status    = "processing"
+    session.status    = "ready"   # vidéo disponible, pipeline pas encore lancé
     await session.save()
 
     return {
@@ -352,37 +352,36 @@ async def upload_video(
 
 @router.post(
     "/{session_id}/analyze",
+    status_code=202,
     summary="Lancer l'analyse IA (pipeline pose_ex3_3d_savgol)",
 )
 async def analyze_session(
     session_id: str,
+    background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user),
 ):
     """
-    Déclenche le pipeline IA sur la vidéo uploadée.
+    Déclenche le pipeline IA sur la vidéo uploadée de façon non-bloquante.
+
+    La route répond immédiatement avec HTTP 202 Accepted.
+    Le pipeline s'exécute en tâche de fond via asyncio.create_subprocess_exec()
+    sans bloquer le serveur FastAPI.
+
+    Suivi du statut :
+      - created    → processing  (dès cet appel)
+      - processing → completed   (fin pipeline OK)
+      - processing → error       (échec pipeline)
+
+    Le client doit poller GET /sessions/{id} jusqu'à status != 'processing',
+    puis appeler GET /sessions/{id}/results pour les métriques.
 
     Prérequis :
-      - La session doit avoir un video_url non vide (POST /upload effectué).
-      - phase_annotations recommandées pour une analyse par phase correcte.
-        Sans annotations, le pipeline tourne en mode exploration (passe 1).
-        Avec annotations, il effectue la comparaison normative complète (passe 2).
-
-    Point critique (rapport de synthèse) :
-      La comparaison session_mean vs normative_phase était méthodologiquement
-      incorrecte. Le pipeline Ex3 compare uniquement les angles mesurés
-      dans la fenêtre de phase (PHASE_WINDOW=15 frames autour de la frame annotée),
-      pas la moyenne globale de la session. Les phase_annotations sont donc
-      indispensables pour des résultats cliniquement valides.
-
-    Phase actuelle (Phase 3) :
-      Lance le pipeline de façon synchrone via subprocess pour la démo.
-      Le status passe à 'processing' puis 'completed' ou 'error'.
-
-    Phase 4 :
-      Remplacer subprocess par asyncio.create_task() ou
-      FastAPI BackgroundTasks pour un traitement non-bloquant.
+      - video_url non vide (POST /upload effectué).
+      - phase_annotations recommandées pour les résultats cliniques complets.
+        Sans annotations → passe 1 exploration (pas de sauvegarde MongoDB).
+        Avec annotations → passe 2 complète (métriques + alertes en base).
     """
-    import subprocess, sys, os
+    import sys, os
 
     session = await _get_session_or_403(session_id, str(current_user.id))
 
@@ -392,80 +391,152 @@ async def analyze_session(
             detail="Aucune vidéo uploadée. Utilisez d'abord POST /sessions/{id}/upload",
         )
 
-    if session.status not in ("processing","completed", "error"):
+    if session.status == "processing":
+        raise HTTPException(
+            status_code=409,
+            detail="Une analyse est déjà en cours pour cette session.",
+        )
+
+    if session.status not in ("created", "ready", "completed", "error"):
         raise HTTPException(
             status_code=422,
             detail=f"Impossible de lancer l'analyse depuis le statut '{session.status}'",
         )
 
-    # Construction de l'argument --phases depuis les annotations stockées
+    # ── Construction de la commande ──────────────────────────
     phases_arg = None
     if session.phase_annotations:
-        phases_arg = ",".join(
-            f"{k}={v}" for k, v in session.phase_annotations.items()
-        )
-        # Ex : "trophy_position=145,racket_low_point=210,ball_impact=240"
+        # Exclure la clé "variant" des phases passées au pipeline
+        phase_only = {k: v for k, v in session.phase_annotations.items()
+                      if k != "variant"}
+        if phase_only:
+            phases_arg = ",".join(f"{k}={v}" for k, v in phase_only.items())
 
-    project_root = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..")
-    )
+    project_root    = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     pipeline_script = os.path.join(project_root, "src", "pipeline", "pose_ex3_3d_savgol.py")
+
+    GESTURE_MAP = {"service": "serve", "coup_droit": "forehand", "revers": "backhand"}
+    gesture_arg = GESTURE_MAP.get(session.gesture_type, "serve")
+
+    variant_arg = None
+    if gesture_arg == "backhand" and session.phase_annotations:
+        raw_variant = session.phase_annotations.get("variant")
+        if raw_variant in (1, 2):
+            variant_arg = f"{raw_variant}h"
 
     cmd = [
         sys.executable,
         pipeline_script,
-        "--video", session.video_url,
+        "--video",      session.video_url,
         "--session_id", session_id,
+        "--gesture",    gesture_arg,
     ]
+    if variant_arg:
+        cmd += ["--variant", variant_arg]
     if phases_arg:
         cmd += ["--phases", phases_arg]
     else:
         cmd += ["--no_mongo"]
 
+    # ── Passer en processing avant de rendre la main ────────
     session.status = "processing"
     await session.save()
 
+    # ── Tâche de fond ────────────────────────────────────────
+    background_tasks.add_task(
+        _run_pipeline_background,
+        session_id=session_id,
+        cmd=cmd,
+        project_root=project_root,
+        has_annotations=phases_arg is not None,
+    )
+
+    return {
+        "message":         "Analyse lancée en arrière-plan",
+        "session_id":      session_id,
+        "status":          "processing",
+        "has_annotations": phases_arg is not None,
+        "hint": (
+            None if phases_arg
+            else "Passe 1 lancée. Annotez les frames clés via PUT /annotations puis relancez."
+        ),
+    }
+
+
+async def _run_pipeline_background(
+    session_id: str,
+    cmd: list,
+    project_root: str,
+    has_annotations: bool,
+) -> None:
+    """
+    Exécute le pipeline IA de façon non-bloquante via run_in_executor().
+
+    asyncio.create_subprocess_exec() n'est pas supporté sur Windows avec
+    SelectorEventLoop (utilisé par Uvicorn). On délègue subprocess.run()
+    à un ThreadPoolExecutor — le thread est bloquant mais la boucle asyncio
+    reste libre pour traiter les autres requêtes.
+
+    Met à jour session.status en base ('completed' ou 'error') à la fin.
+    """
+    import asyncio, os, subprocess, functools
+
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
+    env["PYTHONUTF8"]       = "1"
 
-    try:
-        result = subprocess.run(
+    session = await Session.get(session_id)
+    if not session:
+        print(f"[BG] Session {session_id} introuvable — abandon.")
+        return
+
+    def _run_sync() -> subprocess.CompletedProcess:
+        return subprocess.run(
             cmd,
             capture_output=True,
             timeout=600,
-            encoding="utf-8",
-            errors="replace",
             cwd=project_root,
             env=env,
         )
 
-        stderr_tail = (result.stderr or "")[-500:]
-        stdout_tail = (result.stdout or "")[-200:]
+    try:
+        loop   = asyncio.get_event_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, _run_sync),
+            timeout=620,  # légèrement supérieur au timeout interne
+        )
+
+        stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+        stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+
+        if stdout:
+            print(f"[BG/{session_id}] stdout:\n{stdout[-1000:]}")
+        if stderr:
+            print(f"[BG/{session_id}] stderr:\n{stderr[-500:]}")
 
         if result.returncode == 0:
             session.status = "completed"
-            await session.save()
-            return {
-                "message": "Analyse terminee avec succes",
-                "session_id": session_id,
-                "phases_used": session.phase_annotations,
-                "has_annotations": phases_arg is not None,
-                "hint": (
-                    None if phases_arg
-                    else "Analyse exploratoire terminee. Annotez les frames cles puis relancez."
-                ),
-            }
+            print(f"[BG] Session {session_id} → completed ✓")
         else:
             session.status = "error"
-            await session.save()
-            detail = stderr_tail or stdout_tail or "Erreur pipeline inconnue"
-            raise HTTPException(status_code=500, detail=f"Erreur pipeline : {detail}")
+            print(f"[BG] Session {session_id} → error (code {result.returncode})")
 
-    except subprocess.TimeoutExpired:
+        await session.save()
+
+    except asyncio.TimeoutError:
+        print(f"[BG] Timeout pipeline session {session_id}")
         session.status = "error"
         await session.save()
-        raise HTTPException(status_code=504, detail="Timeout : pipeline > 10 min")
+
+    except Exception as exc:
+        import traceback
+        print(f"[BG] Exception pipeline session {session_id} : {exc}")
+        print(f"[BG] Traceback:\n{traceback.format_exc()}")
+        try:
+            session.status = "error"
+            await session.save()
+        except Exception:
+            pass
 
 
 # ── Résultats ────────────────────────────────────────────────
@@ -738,9 +809,24 @@ async def get_phase_candidates(
             "key_angles":      key_angles,
             "top3": [
                 {
-                    "frame":      fn,
-                    "score":      round(score, 3),
-                    "confidence": conf,
+                    "frame":          fn,
+                    "score":          round(score, 3),
+                    "confidence":     conf,
+                    "screenshot_b64": (
+                        extract_frame_screenshot(
+                            session.video_url, fn,
+                            frame_lookup[fn], phase_name, conf
+                        )
+                        if has_video and fn in frame_lookup else ""
+                    ),
+                    "key_angles": (
+                        {
+                            JOINT_SHORT.get(joint, joint): round(v, 1)
+                            for joint in list(normatives.get(phase_name, {}).keys())[:5]
+                            if (v := frame_lookup[fn].get("angles", {}).get(joint)) is not None
+                        }
+                        if fn in frame_lookup else {}
+                    ),
                 }
                 for fn, score, conf in top3
             ],

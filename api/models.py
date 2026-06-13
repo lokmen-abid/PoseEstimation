@@ -37,7 +37,7 @@ class Session(Document):
     specialist_id: str
     gesture_type: str  # "service" | "coup_droit" | "revers"
     video_url: str
-    status: str = "created"  # "created" | "processing" | "completed" | "error"
+    status: str = "created"  # "created" | "ready" | "processing" | "completed" | "error"
     fps: int = 30
     total_frames: Optional[int] = None
     phase_annotations: Optional[Dict[str, int]] = None  # {"trophy_position": 145, ...}

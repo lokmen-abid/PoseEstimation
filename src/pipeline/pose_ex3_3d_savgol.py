@@ -275,11 +275,113 @@ def download_youtube(url: str, output_dir: str) -> str:
     raise RuntimeError("Aucun fichier mp4 trouvé")
 
 # ─────────────────────────────────────────────
+# ALERTES CLINIQUES
+# ─────────────────────────────────────────────
+
+def generate_alerts(phase_angles: Dict, gesture_type: str,
+                    variant: str = None) -> List[Dict]:
+    """
+    Génère les alertes cliniques (ClinicalAlert) en comparant les angles
+    mesurés aux seuils alert_min / alert_max définis dans normatives.py.
+
+    Logique de sévérité (2 niveaux) :
+      - warning  : angle hors ±1σ du target, mais dans les limites alert_*
+      - critical : angle hors des limites alert_min / alert_max
+
+    Seules les phases effectivement annotées (présentes dans phase_angles)
+    sont évaluées — on ne génère jamais d'alerte sur une valeur manquante.
+
+    Args:
+        phase_angles : Dict produit par extract_phase_angles()
+                       {phase: {joint: {mean, std, min, max}}}
+        gesture_type : "serve" | "forehand" | "backhand"
+        variant      : "1h" | "2h" (backhand uniquement)
+
+    Returns:
+        Liste de dicts compatibles avec le modèle ClinicalAlert de models.py
+        [{joint, value, threshold, reference, severity, phase, note}, ...]
+    """
+    # Import local pour éviter une dépendance circulaire au niveau module
+    try:
+        from normatives import get_normatives
+    except ImportError:
+        # Chemin alternatif si lancé depuis la racine du projet
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+        from normatives import get_normatives
+
+    try:
+        normatives = get_normatives(gesture_type, variant)
+    except ValueError as e:
+        print(f"[WARN] generate_alerts : {e}")
+        return []
+
+    alerts = []
+
+    for phase_name, joints_norms in normatives.items():
+        # Ne traiter que les phases réellement mesurées
+        if phase_name not in phase_angles:
+            continue
+
+        measured_joints = phase_angles[phase_name]
+
+        for joint, norm in joints_norms.items():
+            if joint not in measured_joints:
+                continue
+
+            value     = measured_joints[joint]["mean"]
+            target    = norm["target"]
+            std       = norm["std"]
+            alert_min = norm.get("alert_min")
+            alert_max = norm.get("alert_max")
+            ref       = norm.get("ref", "")
+            note      = norm.get("note", "")
+
+            # ── Déterminer la sévérité ──────────────────────────
+            is_critical = False
+            is_warning  = False
+
+            if alert_min is not None and value < alert_min:
+                is_critical = True
+                threshold   = alert_min
+            elif alert_max is not None and value > alert_max:
+                is_critical = True
+                threshold   = alert_max
+            elif abs(value - target) > std:
+                # Hors ±1σ mais dans les limites alert — warning
+                is_warning = True
+                # Seuil affiché = borne 1σ franchie
+                threshold  = target - std if value < target else target + std
+            else:
+                continue  # Dans la norme, pas d'alerte
+
+            severity = "critical" if is_critical else "warning"
+
+            alerts.append({
+                "joint":     joint,
+                "value":     round(value, 2),
+                "threshold": round(threshold, 2),
+                "reference": ref,
+                "severity":  severity,
+                "phase":     phase_name,
+                "note":      note,
+            })
+
+            print(f"[Alert] {severity.upper()} — {phase_name}/{joint} : "
+                  f"{value:.1f}° (seuil {threshold:.1f}°) [{ref}]")
+
+    print(f"[Alertes] {len(alerts)} alerte(s) générée(s) pour {gesture_type}.")
+    return alerts
+
+
+# ─────────────────────────────────────────────
 # METRICS
 # ─────────────────────────────────────────────
 
 def aggregate_metrics(smoothed: List[Dict], annotations: Dict,
-                      phase_angles: Dict, session_id: str) -> Dict:
+                      phase_angles: Dict, session_id: str,
+                      gesture_type: str = "serve",
+                      variant: str = None) -> Dict:
     joint_metrics = {}
     for key in (smoothed[0].keys() if smoothed else []):
         vals = [a[key] for a in smoothed if a.get(key) is not None]
@@ -311,16 +413,22 @@ def aggregate_metrics(smoothed: List[Dict], annotations: Dict,
                 "phase":          norm["phase"],
                 "source":         source,
             }
+
+    # ── Alertes cliniques ─────────────────────
+    # Générées uniquement si des phases ont été annotées (passe 2).
+    # En passe 1 (exploration), phase_angles est vide → pas d'alertes.
+    alerts = generate_alerts(phase_angles, gesture_type, variant) if phase_angles else []
+
     return {
         "session_id":           session_id,
-        "gesture_type":         "serve",
+        "gesture_type":         gesture_type,
         "pipeline_mode":        PIPELINE_MODE,
         "total_frames":         len(smoothed),
         "phases_detected":      annotations,
         "phase_angles":         phase_angles,
         "joint_metrics":        joint_metrics,
         "normative_comparison": norm_cmp,
-        "alerts":               [],
+        "alerts":               alerts,
         "computed_at":          datetime.now(timezone.utc).isoformat(),
     }
 
@@ -329,19 +437,93 @@ def aggregate_metrics(smoothed: List[Dict], annotations: Dict,
 # ─────────────────────────────────────────────
 
 async def save_to_mongodb(frames_data: List[Dict], metrics: Dict):
+    """
+    Sauvegarde les frames et les métriques dans MongoDB Atlas.
+
+    Utilise motor directement pour les Frame (volume élevé, insert_many plus rapide),
+    et construit un document Metrics structuré compatible avec le modèle Beanie
+    de models.py (champs joint_metrics, alerts, normative_comparison, etc.)
+    pour que GET /sessions/{id}/results puisse le lire sans conversion.
+    """
     try:
         import motor.motor_asyncio
     except ImportError:
         print("[WARN] motor non installé"); return
     if not MONGO_URI:
         print("[WARN] MONGODB_ATLAS_URI non défini"); return
+
     client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
+
+    # ── 1. Frames (insert_many brut — volume élevé, Beanie trop lent ici) ──
     if frames_data:
-        await db["frames"].insert_many(frames_data)
-    await db["metrics"].insert_one(metrics)
+        # On garde uniquement les champs du modèle Frame de models.py
+        # keypoints : on exclut mid_hip / mid_shoulder (virtuels, non stockés)
+        VIRTUAL_KPS = {"mid_hip", "mid_shoulder"}
+        docs_to_insert = []
+        for d in frames_data:
+            kps_raw = d.get("keypoints") or {}
+            kps_clean = {
+                k: v for k, v in kps_raw.items()
+                if k not in VIRTUAL_KPS and v is not None
+            }
+            docs_to_insert.append({
+                "session_id":    d["session_id"],
+                "frame_number":  d["frame_number"],
+                "timestamp_ms":  d["timestamp_ms"],
+                "phase":         d.get("phase"),
+                "pipeline_mode": d.get("pipeline_mode", PIPELINE_MODE),
+                "keypoints":     kps_clean,
+                "angles":        d.get("angles") or {},
+            })
+        await db["frames"].insert_many(docs_to_insert)
+        print(f"[MongoDB] {len(docs_to_insert)} frames insérées.")
+
+    # ── 2. Metrics — document structuré compatible modèle Beanie ──
+    #
+    # models.py → Metrics :
+    #   session_id         : str
+    #   gesture_type       : str   ("serve" | "forehand" | "backhand")
+    #   pipeline_mode      : str
+    #   total_frames       : int
+    #   phases_detected    : Dict[str, int]
+    #   joint_metrics      : Dict[str, JointMetrics]  {min, max, mean, std}
+    #   normative_comparison : Dict[str, Any]
+    #   alerts             : List[ClinicalAlert]       {joint, value, threshold, reference, severity}
+    #   computed_at        : datetime
+    #
+    # Le pipeline produit joint_metrics et normative_comparison dans le bon format.
+    # alerts est vide pour l'instant (Phase 3 — validé dans le rapport de synthèse).
+
+    # joint_metrics : déjà {joint: {min, max, mean, std}} — format JointMetrics ✓
+    joint_metrics = metrics.get("joint_metrics") or {}
+
+    # normative_comparison : déjà {joint: {measured_mean, normative_mean, ...}} ✓
+    normative_comparison = metrics.get("normative_comparison") or {}
+
+    # alerts : liste générée par generate_alerts() dans aggregate_metrics()
+    # Chaque alerte est déjà un dict {joint, value, threshold, reference, severity, phase, note}
+    alerts: List[Dict] = metrics.get("alerts") or []
+
+    metrics_doc = {
+        "session_id":           metrics["session_id"],
+        "gesture_type":         metrics.get("gesture_type", "serve"),
+        "pipeline_mode":        metrics.get("pipeline_mode", PIPELINE_MODE),
+        "total_frames":         metrics.get("total_frames", 0),
+        "phases_detected":      metrics.get("phases_detected") or {},
+        "joint_metrics":        joint_metrics,
+        "normative_comparison": normative_comparison,
+        "alerts":               alerts,
+        "computed_at":          metrics.get("computed_at",
+                                    datetime.now(timezone.utc).isoformat()),
+    }
+
+    # Supprimer l'ancien document si on re-lance le pipeline sur la même session
+    await db["metrics"].delete_many({"session_id": metrics["session_id"]})
+    await db["metrics"].insert_one(metrics_doc)
+
     client.close()
-    print("[MongoDB] Sauvegarde terminée.")
+    print("[MongoDB] Métriques sauvegardées (format Beanie compatible).")
 
 # ─────────────────────────────────────────────
 # PIPELINE
@@ -349,7 +531,9 @@ async def save_to_mongodb(frames_data: List[Dict], metrics: Dict):
 
 async def run_pipeline(video_path: str, session_id: str,
                        phase_annotations: Dict[str, int],
-                       save_mongo: bool = True):
+                       save_mongo: bool = True,
+                       gesture_type: str = "serve",
+                       variant: str = None):
 
     if not os.path.exists(TASK_MODEL_PATH):
         raise RuntimeError(f"Modèle introuvable : {TASK_MODEL_PATH}")
@@ -441,7 +625,9 @@ async def run_pipeline(video_path: str, session_id: str,
     frames_data  = assign_phases_to_frames(raw_frames_data, phase_annotations)
     phase_angles = extract_phase_angles(smoothed_angles, phase_annotations)
     metrics      = aggregate_metrics(smoothed_angles, phase_annotations,
-                                     phase_angles, session_id)
+                                     phase_angles, session_id,
+                                     gesture_type=gesture_type,
+                                     variant=variant)
 
     # ── Résumé console ──
     print("\n" + "="*60)
@@ -505,6 +691,12 @@ def parse_args():
     p.add_argument("--session_id", required=True)
     p.add_argument("--phases", type=str, default=None,
                    help="Ex: 'trophy_position=145,racket_low_point=210,ball_impact=240'")
+    p.add_argument("--gesture", type=str, default="serve",
+                   choices=["serve", "forehand", "backhand"],
+                   help="Type de geste analysé (default: serve)")
+    p.add_argument("--variant", type=str, default=None,
+                   choices=["1h", "2h"],
+                   help="Variante backhand : 1h (une main) ou 2h (deux mains)")
     p.add_argument("--no_mongo", action="store_true")
     return p.parse_args()
 
@@ -524,7 +716,9 @@ async def main():
         video_path = args.video
 
     await run_pipeline(video_path, args.session_id,
-                       phase_annotations, save_mongo=not args.no_mongo)
+                       phase_annotations, save_mongo=not args.no_mongo,
+                       gesture_type=args.gesture,
+                       variant=args.variant)
 
 
 if __name__ == "__main__":
