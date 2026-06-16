@@ -3,7 +3,8 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, Literal
 from api.models import Session, Athlete, Frame, Metrics
 from api.auth import get_current_user
-
+from fastapi.responses import StreamingResponse
+import io
 router = APIRouter(tags=["Sessions"])
 
 # ── Constantes ──────────────────────────────────────────────
@@ -296,6 +297,78 @@ async def get_sessions_by_athlete(
         "data":  [_serialize(s) for s in sessions],
     }
 
+
+@router.get(
+    "/athlete/{athlete_id}/evolution",
+    summary="Évolution longitudinale des angles d'un athlète",
+)
+async def get_athlete_evolution(
+        athlete_id: str,
+        current_user=Depends(get_current_user),
+):
+    """
+    Agrège les métriques de toutes les sessions 'completed' d'un athlète
+    et retourne une série temporelle par articulation.
+
+    Format retourné :
+    {
+      "athlete_id": "...",
+      "sessions_count": 3,
+      "series": [
+        {
+          "session_id": "...",
+          "date": "2026-05-10",
+          "gesture_type": "service",
+          "joints": {
+            "knee_flexion_right": { "mean": 130.2, "std": 3.4 },
+            ...
+          },
+          "alerts_count": 2
+        },
+        ...
+      ]
+    }
+    """
+    await _get_athlete_or_403(athlete_id, str(current_user.id))
+
+    # Toutes les sessions complétées, triées par date croissante
+    sessions = await Session.find(
+        Session.athlete_id == athlete_id,
+        Session.status == "completed",
+    ).sort("+created_at").to_list()
+
+    if not sessions:
+        return {"athlete_id": athlete_id, "sessions_count": 0, "series": []}
+
+    series = []
+    for s in sessions:
+        sid = str(s.id)
+        metrics = await Metrics.find_one(Metrics.session_id == sid)
+        if not metrics:
+            continue
+
+        # Extraire uniquement mean + std par joint (suffisant pour graphiques)
+        joints = {
+            joint: {
+                "mean": round(m.mean, 1),
+                "std": round(m.std, 1),
+            }
+            for joint, m in (metrics.joint_metrics or {}).items()
+        }
+
+        series.append({
+            "session_id": sid,
+            "date": s.created_at.strftime("%Y-%m-%d") if s.created_at else "",
+            "gesture_type": s.gesture_type,
+            "joints": joints,
+            "alerts_count": len(metrics.alerts or []),
+        })
+
+    return {
+        "athlete_id": athlete_id,
+        "sessions_count": len(series),
+        "series": series,
+    }
 
 # ── Upload vidéo ─────────────────────────────────────────────
 
@@ -606,6 +679,100 @@ async def get_session_results(
         "computed_at": metrics.computed_at.isoformat() if metrics.computed_at else None,
     }
 
+@router.get(
+    "/{session_id}/report",
+    summary="Générer et télécharger le rapport PDF d'une session",
+    response_class=StreamingResponse,
+)
+async def export_session_report(
+    session_id: str,
+    current_user=Depends(get_current_user),
+):
+    """
+    Génère le rapport PDF biomécanique de la session et le retourne
+    en téléchargement direct (Content-Disposition: attachment).
+
+    Requiert :
+      - La session doit exister et appartenir au spécialiste connecté.
+      - Le statut doit être 'completed' (analyse terminée).
+      - Un document Metrics doit exister en base pour cette session.
+
+    Le PDF est généré en mémoire (io.BytesIO) — aucun fichier sur disque.
+    """
+    # ── 1. Vérifications ────────────────────────────────────────
+    session = await _get_session_or_403(session_id, str(current_user.id))
+
+    if session.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail="L'analyse n'est pas encore terminée. Statut actuel : " + session.status,
+        )
+
+    # ── 2. Récupérer l'athlète ──────────────────────────────────
+    athlete = await Athlete.get(session.athlete_id)
+    if not athlete:
+        raise HTTPException(status_code=404, detail="Athlète introuvable")
+
+    # ── 3. Récupérer les métriques ──────────────────────────────
+    metrics_doc = await Metrics.find_one(Metrics.session_id == session_id)
+    if not metrics_doc:
+        raise HTTPException(
+            status_code=404,
+            detail="Aucune métrique disponible. Lancez d'abord l'analyse complète (passe 2).",
+        )
+
+    # ── 4. Normaliser normative_comparison ──────────────────────
+    # Le champ peut contenir des dicts complets {measured_mean, normative_mean, ...}
+    # ou des floats (format legacy).  generate_pdf() gère les deux cas.
+    norm_comp = metrics_doc.normative_comparison or {}
+
+    # ── 5. Normaliser alerts ─────────────────────────────────────
+    raw_alerts = metrics_doc.alerts or []
+    # Beanie retourne des objets ClinicalAlert (Pydantic) → convertir en dicts
+    alerts_list = []
+    for a in raw_alerts:
+        if hasattr(a, "model_dump"):
+            alerts_list.append(a.model_dump())
+        elif hasattr(a, "dict"):
+            alerts_list.append(a.dict())
+        elif isinstance(a, dict):
+            alerts_list.append(a)
+
+    # ── 6. Générer le PDF ────────────────────────────────────────
+    from api.routes.report_generator import generate_pdf
+
+    pdf_bytes = generate_pdf(
+        session_id           = session_id,
+        gesture_type         = session.gesture_type,
+        created_at           = session.created_at.isoformat() if session.created_at else None,
+        pipeline_mode        = metrics_doc.pipeline_mode or "ex3_3d_savgol",
+        total_frames         = metrics_doc.total_frames or 0,
+        athlete_name         = athlete.name,
+        athlete_age          = athlete.age,
+        athlete_hand         = athlete.dominant_hand or "—",
+        phase_annotations    = session.phase_annotations,
+        joint_metrics        = {
+            k: (v.model_dump() if hasattr(v, "model_dump") else dict(v) if not isinstance(v, dict) else v)
+            for k, v in (metrics_doc.joint_metrics or {}).items()
+        },
+        normative_comparison = norm_comp,
+        alerts               = alerts_list,
+    )
+
+    # ── 7. Nom du fichier ────────────────────────────────────────
+    safe_name   = athlete.name.replace(" ", "_").replace("/", "-")
+    gesture_tag = session.gesture_type
+    filename    = f"rapport_{safe_name}_{gesture_tag}_{session_id[:8]}.pdf"
+
+    # ── 8. StreamingResponse ─────────────────────────────────────
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(pdf_bytes)),
+        },
+    )
 
 @router.get(
     "/{session_id}/candidates",

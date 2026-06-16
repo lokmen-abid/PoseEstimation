@@ -154,6 +154,7 @@ async def update_athlete(
 
     if data.name is not None: athlete.name = data.name
     if data.age is not None: athlete.age = data.age
+    if data.sex is not None: athlete.sex = data.sex
     if data.dominant_hand is not None: athlete.dominant_hand = data.dominant_hand
     if data.medical_notes is not None: athlete.medical_notes = data.medical_notes
 

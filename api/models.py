@@ -106,6 +106,8 @@ class ClinicalAlert(BaseModel):
     threshold: float
     reference: str  # "Gorce2024" | "Knudson2001" | "Elliott2008"
     severity: str  # "warning" | "critical"
+    phase: str
+    note: str
 
 
 class Metrics(Document):
