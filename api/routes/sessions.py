@@ -94,6 +94,7 @@ def _serialize(s: Session) -> dict:
         "video_url":         s.video_url,
         "phase_annotations": s.phase_annotations,
         "created_at":        s.created_at.isoformat() if s.created_at else None,
+        "error_message":     s.error_message,
     }
 
 
@@ -573,10 +574,10 @@ async def _run_pipeline_background(
         )
 
     try:
-        loop   = asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
         result = await asyncio.wait_for(
             loop.run_in_executor(None, _run_sync),
-            timeout=620,  # légèrement supérieur au timeout interne
+            timeout=620,
         )
 
         stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
@@ -589,9 +590,13 @@ async def _run_pipeline_background(
 
         if result.returncode == 0:
             session.status = "completed"
+            session.error_message = None  # ← effacer erreur précédente si re-run
             print(f"[BG] Session {session_id} → completed ✓")
         else:
             session.status = "error"
+            # Garder les 500 derniers caractères du stderr — utile pour le debug
+            session.error_message = (stderr[-500:] or stdout[-200:] or
+                                     f"Pipeline retourné code {result.returncode}").strip()
             print(f"[BG] Session {session_id} → error (code {result.returncode})")
 
         await session.save()
@@ -599,6 +604,7 @@ async def _run_pipeline_background(
     except asyncio.TimeoutError:
         print(f"[BG] Timeout pipeline session {session_id}")
         session.status = "error"
+        session.error_message = "Timeout : le pipeline a dépassé 10 minutes."
         await session.save()
 
     except Exception as exc:
@@ -607,6 +613,7 @@ async def _run_pipeline_background(
         print(f"[BG] Traceback:\n{traceback.format_exc()}")
         try:
             session.status = "error"
+            session.error_message = str(exc)[:500]
             await session.save()
         except Exception:
             pass
@@ -774,6 +781,185 @@ async def export_session_report(
         },
     )
 
+
+@router.get(
+    "/{session_id}/export/csv",
+    summary="Exporter les métriques de la session en CSV",
+    response_class=StreamingResponse,
+)
+async def export_session_csv(
+        session_id: str,
+        current_user=Depends(get_current_user),
+):
+    """
+    Génère un fichier CSV avec toutes les métriques articulaires
+    et la comparaison normative. Téléchargement direct.
+
+    Colonnes :
+      Articulation, Min (°), Max (°), Moyenne (°), Écart-type,
+      Normative (°), Δ (°), Dans 1σ, Source, Alertes
+    """
+    import csv
+
+    # ── 1. Vérifications ────────────────────────────────────
+    session = await _get_session_or_403(session_id, str(current_user.id))
+
+    if session.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail="La session n'est pas encore complétée.",
+        )
+
+    metrics_doc = await Metrics.find_one(Metrics.session_id == session_id)
+    if not metrics_doc:
+        raise HTTPException(
+            status_code=404,
+            detail="Aucune métrique disponible pour cette session.",
+        )
+
+    athlete = await Athlete.get(session.athlete_id)
+
+    # ── 2. Labels traduits ───────────────────────────────────
+    JOINT_LABELS = {
+        "knee_flexion_right": "Flexion genou D",
+        "knee_flexion_left": "Flexion genou G",
+        "trunk_inclination": "Inclinaison tronc",
+        "trunk_rotation": "Rotation tronc",
+        "shoulder_rotation_right": "Rotation épaule D",
+        "shoulder_elevation_right": "Élévation épaule D",
+        "shoulder_elevation_left": "Élévation épaule G",
+        "elbow_right": "Flexion coude D",
+        "elbow_left": "Flexion coude G",
+        "hip_right": "Hanche D",
+        "hip_left": "Hanche G",
+    }
+
+    GESTURE_LABELS = {
+        "service": "Service",
+        "coup_droit": "Coup droit",
+        "revers": "Revers",
+    }
+
+    def jlabel(k: str) -> str:
+        return JOINT_LABELS.get(k, k.replace("_", " ").title())
+
+    # ── 3. Construire le CSV en mémoire ──────────────────────
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=",", quoting=csv.QUOTE_MINIMAL)
+
+    # En-tête du rapport
+    athlete_name = athlete.name if athlete else "—"
+    gesture = GESTURE_LABELS.get(session.gesture_type, session.gesture_type)
+    date_str = session.created_at.strftime("%d/%m/%Y") if session.created_at else "—"
+
+    writer.writerow(["IA/Serve — Rapport d'analyse biomécanique"])
+    writer.writerow(["Athlète", athlete_name])
+    writer.writerow(["Geste", gesture])
+    writer.writerow(["Date", date_str])
+    writer.writerow(["Pipeline", metrics_doc.pipeline_mode or "ex3_3d_savgol"])
+    writer.writerow(["Frames analysées", metrics_doc.total_frames or 0])
+    writer.writerow([])  # ligne vide
+
+    # ── Section métriques articulaires ───────────────────────
+    writer.writerow(["MÉTRIQUES ARTICULAIRES"])
+    writer.writerow([
+        "Articulation", "Min (°)", "Max (°)", "Moyenne (°)", "Écart-type (°)"
+    ])
+
+    for joint_key, m in (metrics_doc.joint_metrics or {}).items():
+        if hasattr(m, "model_dump"):
+            md = m.model_dump()
+        elif hasattr(m, "dict"):
+            md = m.dict()
+        else:
+            md = dict(m) if not isinstance(m, dict) else m
+
+        writer.writerow([
+            jlabel(joint_key),
+            f"{md.get('min', 0):.1f}",
+            f"{md.get('max', 0):.1f}",
+            f"{md.get('mean', 0):.1f}",
+            f"{md.get('std', 0):.1f}",
+        ])
+
+    writer.writerow([])  # ligne vide
+
+    # ── Section comparaison normative ────────────────────────
+    writer.writerow(["COMPARAISON NORMATIVE — Gorce 2024 / Elliott 2008"])
+    writer.writerow([
+        "Articulation", "Mesuré (°)", "Normative (°)",
+        "Δ (°)", "Dans 1σ", "Source"
+    ])
+
+    for joint_key, comp in (metrics_doc.normative_comparison or {}).items():
+        if isinstance(comp, dict):
+            measured = comp.get("measured_mean", 0) or 0
+            normative = comp.get("normative_mean", 0) or 0
+            delta = comp.get("delta_degrees", 0) or 0
+            within_1sd = comp.get("within_1std", True)
+            source = comp.get("source", "—")
+        else:
+            measured, normative, delta = 0, 0, float(comp)
+            within_1sd, source = True, "—"
+
+        writer.writerow([
+            jlabel(joint_key),
+            f"{measured:.1f}",
+            f"{normative:.1f}",
+            f"{delta:+.1f}",
+            "Oui" if within_1sd else "Non",
+            source,
+        ])
+
+    writer.writerow([])  # ligne vide
+
+    # ── Section alertes cliniques ────────────────────────────
+    alerts = metrics_doc.alerts or []
+    if alerts:
+        writer.writerow([f"ALERTES CLINIQUES ({len(alerts)})"])
+        writer.writerow([
+            "Articulation", "Phase", "Valeur (°)", "Seuil (°)", "Sévérité", "Référence"
+        ])
+        for a in alerts:
+            if hasattr(a, "model_dump"):
+                ad = a.model_dump()
+            elif hasattr(a, "dict"):
+                ad = a.dict()
+            else:
+                ad = dict(a) if not isinstance(a, dict) else a
+
+            writer.writerow([
+                jlabel(ad.get("joint", "—")),
+                ad.get("phase", "—").replace("_", " "),
+                f"{ad.get('value', 0):.1f}",
+                f"{ad.get('threshold', 0):.1f}",
+                ad.get("severity", "—"),
+                ad.get("reference", "—"),
+            ])
+    else:
+        writer.writerow(["ALERTES CLINIQUES"])
+        writer.writerow(["Aucune alerte clinique détectée"])
+
+    writer.writerow([])
+    writer.writerow(["Session ID", session_id])
+    writer.writerow(["Généré par", "IA/Serve — Plateforme d'analyse biomécanique"])
+
+    # ── 4. Réponse ───────────────────────────────────────────
+    safe_name = (athlete_name).replace(" ", "_").replace("/", "-")
+    gesture_tag = session.gesture_type
+    filename = f"metriques_{safe_name}_{gesture_tag}_{session_id[:8]}.csv"
+
+    csv_bytes = output.getvalue().encode("utf-8-sig")  # BOM pour Excel FR
+
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(csv_bytes)),
+        },
+    )
+
 @router.get(
     "/{session_id}/candidates",
     summary="Frames candidates pour annotation (screenshots + scores)",
@@ -817,9 +1003,10 @@ async def get_phase_candidates(
 
     try:
         from find_phases_gestures import (
-            load_frames, detect_fps, adapt_to_fps,
-            find_candidate_frames, select_best_combination,
-            PHASE_ZONES, get_key_angles_str,
+            load_frames, detect_fps,
+            find_all_candidates, select_best_combination,
+            check_camera_angle_reliability,
+            PHASE_ORDER, get_key_angles_str,
         )
         from normatives import get_normatives
     except ImportError as e:
@@ -839,12 +1026,14 @@ async def get_phase_candidates(
     gesture = GESTURE_MAP.get(session.gesture_type, "serve")
 
     # ── Détection FPS + candidats ─────────────────────────────
-    fps          = detect_fps(frames)
-    local_window, min_frames = adapt_to_fps(fps)
-    normatives   = get_normatives(gesture)
-    zones        = PHASE_ZONES.get(gesture, {})
-    candidates   = find_candidate_frames(frames, gesture, normatives, zones, local_window)
-    best, _      = select_best_combination(candidates, gesture, min_frames)
+    fps                = detect_fps(frames)
+    normatives         = get_normatives(gesture)
+    camera_reliability = check_camera_angle_reliability(frames, gesture)
+    candidates         = find_all_candidates(frames, gesture, normatives, fps,
+                                             camera_reliability)
+    best, _            = select_best_combination(candidates, gesture, fps,
+                                                 frames=frames,
+                                                 camera_reliability=camera_reliability)
 
     # ── Lookup frame par numéro ───────────────────────────────
     frame_lookup = {f["frame_number"]: f for f in frames}
@@ -946,10 +1135,20 @@ async def get_phase_candidates(
         "phases":      {},
     }
 
-    for phase_name, frame_list in candidates.items():
+    phase_order = PHASE_ORDER.get(gesture, list(candidates.keys()))
+    for phase_name in phase_order:
+        frame_list = candidates.get(phase_name, [])
         top3 = frame_list[:3]
-        best_fn   = best.get(phase_name) if best else (top3[0][0] if top3 else None)
-        best_conf = top3[0][2] if top3 else "UNRELIABLE"
+        # Si best=None (veto a tout rejeté ou aucune combinaison valide),
+        # on affiche quand même les candidats mais on force la confiance à
+        # UNRELIABLE pour signaler au spécialiste qu'une vérification manuelle
+        # est nécessaire — on ne cache pas silencieusement l'échec du veto.
+        if best is not None:
+            best_fn   = best.get(phase_name)
+            best_conf = top3[0][2] if top3 else "UNRELIABLE"
+        else:
+            best_fn   = top3[0][0] if top3 else None
+            best_conf = "UNRELIABLE"  # veto a rejeté toutes les combinaisons
 
         # Screenshot de la frame suggérée
         screenshot_b64 = ""
