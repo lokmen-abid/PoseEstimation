@@ -134,3 +134,137 @@ class Club(Document):
 
     class Settings:
         name = "clubs"
+
+
+class MatchSession(Document):
+    """
+    Équivalent de Session mais pour un match complet.
+    Une MatchSession = une vidéo de match entier (plusieurs sets).
+    Workflow identique : created → ready → processing → completed | error
+    """
+    athlete_id: str
+    specialist_id: str
+
+    video_url: str
+    status: str = "created"  # "created" | "ready" | "processing" | "completed" | "error"
+
+    # Infos vidéo remplies après upload
+    fps: int = 30
+    total_frames: Optional[int] = None
+    duration_seconds: Optional[float] = None
+
+    # Contexte du match (renseigné par le spécialiste)
+    surface: str = "hard"  # "hard" | "clay" | "grass"
+    match_format: str = "best_of_3"  # "best_of_3" | "best_of_5" | "pro_set"
+    opponent_name: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=_now)
+    error_message: Optional[str] = None
+
+    class Settings:
+        name = "match_sessions"
+
+
+class GestureEvent(BaseModel):
+    """
+    Un événement de frappe détecté dans la vidéo.
+    Produit par le pipeline analyze_match.py pour chaque coup joué.
+    """
+    frame_number: int
+    timestamp_ms: int
+    gesture_type: str  # "forehand" | "backhand" | "serve" | "volley" | "unknown"
+    confidence: float  # 0.0 – 1.0 (confiance du classificateur)
+    set_number: int  # 1 | 2 | 3 | ...
+    point_number: int  # numéro du point dans le set
+    rally_stroke: int  # numéro de la frappe dans l'échange (1 = service, 2 = retour, ...)
+
+    # Position du joueur au moment de la frappe (pixel, normalisé 0–1)
+    # Rempli si YOLO joueur disponible, None sinon
+    player_x: Optional[float] = None  # 0 = gauche, 1 = droite du court
+    player_y: Optional[float] = None  # 0 = fond, 1 = filet
+
+
+class RallyStats(BaseModel):
+    """Statistiques d'un échange (rally) individuel."""
+    point_number: int
+    set_number: int
+    winner: str  # "player" | "opponent" | "unknown"
+    duration_frames: int
+    duration_seconds: float
+    stroke_count: int  # nombre total de frappes dans l'échange
+    gesture_sequence: List[str]  # ex: ["serve", "forehand", "backhand", "forehand"]
+    outcome: str  # "winner" | "unforced_error" | "forced_error" | "unknown"
+
+
+class SetStats(BaseModel):
+    """
+    Statistiques agrégées pour un set entier.
+    Calculées par le pipeline à partir des GestureEvent et RallyStats.
+    """
+    set_number: int
+    points_won: int
+    points_lost: int
+
+    # Distribution des gestes (nombre de fois joué dans ce set)
+    gesture_counts: Dict[str, int]  # {"forehand": 42, "backhand": 28, "serve": 12, ...}
+    gesture_pct: Dict[str, float]  # {"forehand": 55.3, "backhand": 36.8, ...}
+
+    # Stats d'échanges
+    total_rallies: int
+    avg_rally_length: float  # durée moyenne en secondes
+    avg_strokes_per_rally: float
+
+    # Points selon longueur d'échange
+    short_rally_wins: int  # 1–3 frappes
+    medium_rally_wins: int  # 4–8 frappes
+    long_rally_wins: int  # 9+ frappes
+
+    # Geste le plus utilisé dans ce set
+    dominant_gesture: str
+
+
+class MatchMetrics(Document):
+    """
+    Résultats complets du pipeline analyze_match.py.
+    Un seul document par MatchSession — créé à la fin du traitement.
+    Équivalent de Metrics pour les sessions biomécaniques.
+    """
+    match_session_id: str
+    athlete_id: str
+
+    # Infos générales
+    total_frames_analyzed: int
+    total_points_detected: int
+    total_rallies_detected: int
+    sets_detected: int  # nombre de sets détectés automatiquement
+
+    # Événements bruts (une entrée par frappe détectée)
+    gesture_events: List[GestureEvent]
+
+    # Échanges individuels
+    rallies: List[RallyStats]
+
+    # Stats par set (clé = "1", "2", "3", ...)
+    sets: Dict[str, SetStats]
+
+    # Stats globales sur tout le match
+    overall_gesture_counts: Dict[str, int]
+    overall_gesture_pct: Dict[str, float]
+    dominant_gesture_match: str  # geste le plus utilisé sur tout le match
+
+    avg_rally_length_seconds: float
+    avg_strokes_per_rally: float
+
+    # Points forts et faibles (calculés automatiquement)
+    # Format : [{"aspect": "...", "detail": "...", "value": ...}, ...]
+    strengths: List[Dict[str, Any]]
+    weaknesses: List[Dict[str, Any]]
+
+    # Pipeline info
+    pipeline_version: str = "v1"
+    computed_at: datetime = Field(default_factory=_now)
+
+    class Settings:
+        name = "match_metrics"

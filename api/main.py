@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer
 from contextlib import asynccontextmanager
 from api.database import connect_db
-from api.routes import athletes, sessions, auth_routes, club_routes
+from api.routes import athletes, sessions, auth_routes, club_routes , match_routes
 
 security = HTTPBearer()
 
@@ -31,6 +31,7 @@ app.include_router(auth_routes.router,  prefix="/api/auth",     tags=["Auth"])
 app.include_router(athletes.router,     prefix="/api/athletes", tags=["Athletes"])
 app.include_router(club_routes.router,  prefix="/api/clubs",    tags=["Clubs"])
 app.include_router(sessions.router,     prefix="/api/sessions", tags=["Sessions"])
+app.include_router(match_routes.router, prefix="/api/match-sessions", tags=["Match Analysis"])
 
 @app.get("/")
 async def root():
